@@ -10,6 +10,7 @@ maplibregl.setWorkerUrl(maplibreWorkerUrl)
 
 const mapContainer = ref<HTMLDivElement | null>(null)
 const currentTime = ref(new Date())
+const isSunPanelVisible = ref(true)
 const sunAltitude = computed(() => {
   const position = SunCalc.getPosition(currentTime.value, 52.52, 13.405)
   return Math.round(position.altitude)
@@ -22,6 +23,7 @@ const sunBearing = computed(() => {
 // Plain variable, not ref()/reactive(): Vue's proxies can interfere with the map object
 let map: maplibregl.Map | null = null
 let clockTimer: number | undefined
+let slowRotateCleanup: (() => void) | undefined
 
 const berlinCenter: [number, number] = [13.405, 52.52]
 
@@ -161,6 +163,126 @@ function updateBuildingShadows() {
   source.setData({ type: 'FeatureCollection', features })
 }
 
+function enableSlowControlRotation(mapInstance: maplibregl.Map, container: HTMLDivElement) {
+  mapInstance.dragRotate.disable()
+  mapInstance.dragPan.enable()
+
+  let isRotating = false
+  let lastX = 0
+  let lastY = 0
+  const sensitivity = 0.7
+  const smoothing = 0.22
+  let targetBearing = mapInstance.getBearing()
+  let targetPitch = mapInstance.getPitch()
+  let animationFrame: number | undefined
+
+  const normalizeBearingDelta = (delta: number) => ((delta + 540) % 360) - 180
+
+  const animateCamera = () => {
+    const currentBearing = mapInstance.getBearing()
+    const currentPitch = mapInstance.getPitch()
+    const bearingDelta = normalizeBearingDelta(targetBearing - currentBearing)
+    const pitchDelta = targetPitch - currentPitch
+
+    mapInstance.setBearing(currentBearing + bearingDelta * smoothing)
+    mapInstance.setPitch(currentPitch + pitchDelta * smoothing)
+
+    if (isRotating || Math.abs(bearingDelta) > 0.01 || Math.abs(pitchDelta) > 0.01) {
+      animationFrame = window.requestAnimationFrame(animateCamera)
+    } else {
+      animationFrame = undefined
+    }
+  }
+
+  const startAnimation = () => {
+    if (animationFrame === undefined) {
+      animationFrame = window.requestAnimationFrame(animateCamera)
+    }
+  }
+
+  const onContextMenu = (event: MouseEvent) => {
+    if (isRotating) event.preventDefault()
+  }
+
+  const onPointerDown = (event: PointerEvent) => {
+    if (!event.ctrlKey || event.button !== 0) return
+
+    isRotating = true
+    lastX = event.clientX
+    lastY = event.clientY
+    targetBearing = mapInstance.getBearing()
+    targetPitch = mapInstance.getPitch()
+    mapInstance.dragPan.disable()
+    container.setPointerCapture(event.pointerId)
+    startAnimation()
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
+  const onPointerMove = (event: PointerEvent) => {
+    if (!isRotating) return
+
+    const deltaX = event.clientX - lastX
+    const deltaY = event.clientY - lastY
+    targetBearing += deltaX * sensitivity
+    targetPitch -= deltaY * sensitivity
+    lastX = event.clientX
+    lastY = event.clientY
+    startAnimation()
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
+  const stopRotating = (event: PointerEvent) => {
+    if (!isRotating) return
+
+    isRotating = false
+    targetBearing = mapInstance.getBearing()
+    targetPitch = mapInstance.getPitch()
+    if (animationFrame !== undefined) {
+      window.cancelAnimationFrame(animationFrame)
+      animationFrame = undefined
+    }
+    if (container.hasPointerCapture(event.pointerId)) {
+      container.releasePointerCapture(event.pointerId)
+    }
+    mapInstance.dragPan.enable()
+    event.stopPropagation()
+  }
+
+  const onKeyUp = (event: KeyboardEvent) => {
+    if (event.key === 'Control' && isRotating) {
+      isRotating = false
+      targetBearing = mapInstance.getBearing()
+      targetPitch = mapInstance.getPitch()
+      if (animationFrame !== undefined) {
+        window.cancelAnimationFrame(animationFrame)
+        animationFrame = undefined
+      }
+      mapInstance.dragPan.enable()
+    }
+  }
+
+  container.addEventListener('contextmenu', onContextMenu)
+  container.addEventListener('pointerdown', onPointerDown, true)
+  container.addEventListener('pointermove', onPointerMove, true)
+  container.addEventListener('pointerup', stopRotating, true)
+  container.addEventListener('pointercancel', stopRotating, true)
+  window.addEventListener('keyup', onKeyUp)
+
+  return () => {
+    if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
+    mapInstance.dragRotate.enable()
+    mapInstance.dragPan.enable()
+    container.removeEventListener('contextmenu', onContextMenu)
+    container.removeEventListener('pointerdown', onPointerDown, true)
+    container.removeEventListener('pointermove', onPointerMove, true)
+    container.removeEventListener('pointerup', stopRotating, true)
+    container.removeEventListener('pointercancel', stopRotating, true)
+    window.removeEventListener('keyup', onKeyUp)
+  }
+}
+
 onMounted(() => {
   if (!mapContainer.value) return
 
@@ -168,9 +290,9 @@ onMounted(() => {
     container: mapContainer.value,
     style: 'https://tiles.openfreemap.org/styles/liberty',
     center: [13.405, 52.52], // [longitude, latitude]: Berlin Mitte
-    zoom: 16,
-    pitch: 60,
-    bearing: -20,
+    zoom: 15.7,
+    pitch: 80,
+    bearing: 2,
     maxBounds: [
       [13.0, 52.3], // south-west corner
       [13.85, 52.72], // north-east corner
@@ -178,6 +300,7 @@ onMounted(() => {
   })
 
   map.addControl(new maplibregl.NavigationControl())
+  slowRotateCleanup = enableSlowControlRotation(map, mapContainer.value)
 
   map.once('load', () => {
     const style = map?.getStyle()
@@ -282,6 +405,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (clockTimer !== undefined) window.clearInterval(clockTimer)
+  slowRotateCleanup?.()
   map?.off('moveend', updateBuildingShadows)
   map?.off('zoomend', updateBuildingShadows)
   map?.remove()
@@ -291,21 +415,43 @@ onBeforeUnmount(() => {
 <template>
   <main class="map-shell">
     <div ref="mapContainer" class="map"></div>
-    <section class="sun-panel" aria-live="polite">
-      <h1>Berlin sunlight</h1>
-      <p>Current sun direction and the next six hours</p>
-      <dl>
-        <div>
-          <dt>Sun altitude</dt>
-          <dd>{{ sunAltitude }}°</dd>
-        </div>
-        <div>
-          <dt>Direction</dt>
-          <dd>{{ sunBearing }}°</dd>
-        </div>
-      </dl>
-      <small>Yellow: sunlight direction · Purple: approximate shadow direction</small>
+    <section class="sun-panel" :class="{ 'sun-panel-hidden': !isSunPanelVisible }" aria-live="polite">
+      <div class="sun-panel-header">
+        <h1>Berlin sunlight</h1>
+        <button
+          class="panel-toggle"
+          type="button"
+          :aria-expanded="isSunPanelVisible"
+          :aria-label="isSunPanelVisible ? 'Hide sunlight details' : 'Show sunlight details'"
+          @click="isSunPanelVisible = !isSunPanelVisible"
+        >
+          <span aria-hidden="true">‹</span>
+        </button>
+      </div>
+      <template v-if="isSunPanelVisible">
+        <p>Current sun direction and the next six hours</p>
+        <dl>
+          <div>
+            <dt>Sun altitude</dt>
+            <dd>{{ sunAltitude }}°</dd>
+          </div>
+          <div>
+            <dt>Direction</dt>
+            <dd>{{ sunBearing }}°</dd>
+          </div>
+        </dl>
+        <small>Yellow: sunlight direction · Purple: approximate shadow direction</small>
+      </template>
     </section>
+    <button
+      v-if="!isSunPanelVisible"
+      class="sun-panel-reveal"
+      type="button"
+      aria-label="Show sunlight details"
+      @click="isSunPanelVisible = true"
+    >
+      <span aria-hidden="true">›</span>
+    </button>
   </main>
 </template>
 
@@ -318,6 +464,7 @@ onBeforeUnmount(() => {
 
 .map-shell {
   position: relative;
+  --sun-panel-color: rgb(20 29 43 / 88%);
 }
 
 .sun-panel {
@@ -330,9 +477,74 @@ onBeforeUnmount(() => {
   border: 1px solid rgb(255 255 255 / 35%);
   border-radius: 0.75rem;
   color: #fff;
-  background: rgb(20 29 43 / 88%);
+  background: var(--sun-panel-color);
   box-shadow: 0 0.4rem 1.5rem rgb(0 0 0 / 20%);
   backdrop-filter: blur(0.4rem);
+  transition: transform 0.2s ease;
+}
+
+.sun-panel-hidden {
+  transform: translateX(calc(-100% - 1rem));
+}
+
+.sun-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 1rem;
+}
+
+.panel-toggle {
+  display: grid;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 40%);
+  border-radius: 0.35rem;
+  place-items: center;
+  color: #fff;
+  background: var(--sun-panel-color);
+  cursor: pointer;
+  font: inherit;
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.sun-panel-header .panel-toggle {
+  position: absolute;
+  top: 1rem;
+  right: -1.6rem;
+  order: 2;
+  border-left: 0;
+  border-radius: 0 0.35rem 0.35rem 0;
+}
+
+.panel-toggle:hover {
+  background: var(--sun-panel-color);
+}
+
+.sun-panel-reveal {
+  position: absolute;
+  top: 1rem;
+  left: 0;
+  z-index: 2;
+  width: 1.5rem;
+  height: 4rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0 0.5rem 0.5rem 0;
+  color: #fff;
+  background: var(--sun-panel-color);
+  cursor: pointer;
+  font: inherit;
+  font-size: 1.15rem;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.sun-panel-reveal:hover,
+.sun-panel-reveal:focus-visible {
+  opacity: 1;
 }
 
 h1 {
