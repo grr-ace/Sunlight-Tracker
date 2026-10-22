@@ -70,7 +70,7 @@ npm run build
 - [OpenFreeMap](https://openfreemap.org/)
 - [SunCalc](https://github.com/mourner/suncalc)
 
-## Roadmap
+## Future features
 
 ### Sunlight controls
 
@@ -96,6 +96,7 @@ npm run build
 
 ### Trees and urban features
 
+- Add a view cafes/bars layer that users can hide/show.
 - Add Berlin tree data where open datasets and licensing permit.
 - Model tree crowns and approximate seasonal shadow coverage.
 - Account for tree height, canopy size, and deciduous versus evergreen trees.
